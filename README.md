@@ -1,8 +1,9 @@
 # wrapper-v2
 
 A clean rewrite of the Apple Music FairPlay decryption wrapper. Currently in
-**Phase 0** - the build chain works end-to-end but no Apple-library code has
-been ported yet.
+**Phase 1** - the daemon initializes Apple's native libraries at startup and
+exposes a small HTTP API for managing the stored Media User Token. M3U8 and
+decrypt endpoints are coming in subsequent Phase 1 commits.
 
 ## What it is
 
@@ -20,11 +21,30 @@ the build fails loudly.
 
 | Phase | Goal | State |
 | --- | --- | --- |
-| 0 | Repo skeleton, build chain, NDK toolchain, CI smoke test | **In progress** |
-| 1 | Port the FairPlay loop in C++ against 3.6.0-beta symbols | Pending |
-| 2 | HTTP endpoints: `/health`, `/account`, `/m3u8`, `/decrypt` | Pending |
-| 3 | Caching, rate limit, dedupe, optional auth | Pending |
-| 4 | arm64-v8a build, multi-arch Docker, login state machine | Pending |
+| 0 | Repo skeleton, build chain, NDK toolchain, CI smoke test | **Done** |
+| 1.0 | Apple lib runtime init at startup, `/login` + `/me` endpoints | **In progress** |
+| 1.1 | `/storefront`, `/dev-token` endpoints (Media User Token unused) | Pending |
+| 1.2 | `/m3u8` (asset URL fetch) | Pending |
+| 1.3 | `/decrypt` (full MP4 round-trip, batch sample decrypt) | Pending |
+| 2 | Caching, rate limit, dedupe, request queue | Pending |
+| 3 | arm64-v8a build, multi-arch Docker | Pending |
+
+## HTTP API
+
+Every endpoint accepts and returns `application/json`.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/health` | Liveness probe. Returns `{status, phase, version}`. |
+| `GET` | `/me` | Snapshot of `{runtime, auth, version}`. Reports whether the Apple runtime initialized cleanly and whether a Media User Token is currently cached. |
+| `POST` | `/login` | Body: `{"media_user_token": "..."}`. Caches the token in process memory. Returns the token preview and the timestamp it was set. |
+| `DELETE` | `/login` | Drops the cached Media User Token. Idempotent. |
+
+The Media User Token is the credential Apple's modern Music API uses for
+per-user requests. You obtain it out-of-band - typically from an iOS
+device, an Apple Music web session, or a separate token-extraction tool.
+This wrapper never accepts an Apple ID password and does not run sign-in
+flows; the token *is* the credential.
 
 ## Layout
 
@@ -37,7 +57,12 @@ the build fails loudly.
 ├── src/
 │   ├── daemon/               C++ daemon (cross-compiled with the NDK)
 │   │   ├── CMakeLists.txt
-│   │   └── main.cpp
+│   │   ├── main.cpp          process entry: env parsing, lifecycle
+│   │   ├── server.{hpp,cpp}  HTTP route mounting (cpp-httplib)
+│   │   └── apple/
+│   │       ├── abi.hpp       Apple-lib mangled symbol declarations
+│   │       ├── auth.{hpp,cpp}    Media User Token storage
+│   │       └── runtime.{hpp,cpp} FootHillConfig + DeviceGUID + RequestContext init
 │   └── launcher/
 │       └── wrapper.c         host-Linux chroot launcher
 ├── rootfs/                   chroot tree assembled at build time
@@ -87,12 +112,36 @@ tools/stage-system.sh --arch x86_64
 
 # 4. Build and run.
 docker compose up --build
+
+# 5. Smoke-test.
 curl http://127.0.0.1/health
+curl http://127.0.0.1/me
+
+# 6. Cache a Media User Token.
+curl -X POST http://127.0.0.1/login \
+     -H 'content-type: application/json' \
+     -d '{"media_user_token": "AyL...your-token..."}'
+curl http://127.0.0.1/me        # logged_in: true
+curl -X DELETE http://127.0.0.1/login
 ```
 
 The daemon binds port 80 inside the container and the compose file maps it
 to host port 80 by default. Override with `HTTP_PORT=8080 docker compose up`
 on machines that already have something on `:80`.
+
+### Daemon configuration
+
+The daemon reads `WRAPPER_*` environment variables (forwarded via
+`compose.yaml`). See `.env.example` for the full list. The most useful are:
+
+- `WRAPPER_HOST`, `WRAPPER_PORT` - bind address inside the chroot.
+- `WRAPPER_BASE_DIR` - filesystem dir Apple's libs use for the FairPlay
+  key cache and `mpl_db`. The default matches upstream wrapper.
+- `WRAPPER_DEVICE_INFO` - 9-tuple identifying the fake Apple Music
+  Android client. Same fingerprint upstream uses by default.
+- `WRAPPER_APPLE_INIT=0` - skip Apple lib initialization at startup.
+  Lets you bring up the HTTP server alone for `/health` smoke tests
+  even on builds where you have not staged the Apple libraries yet.
 
 If you already have a single `split_config.x86_64.apk` rather than an
 `.apkm` bundle, swap step 2 for `tools/extract-libs.sh --apk path/to/split_config.x86_64.apk ...` -

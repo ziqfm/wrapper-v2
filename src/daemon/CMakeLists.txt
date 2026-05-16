@@ -52,6 +52,10 @@ endif()
 # -----------------------------------------------------------------------------
 add_executable(main
     main.cpp
+    server.cpp
+    apple/auth.cpp
+    apple/loader.cpp
+    apple/runtime.cpp
 )
 
 target_include_directories(main PRIVATE
@@ -70,9 +74,12 @@ endif()
 
 target_compile_options(main PRIVATE
     -Wall -Wextra -Wpedantic -Werror=return-type
-    -fno-rtti
     -fexceptions
 )
+# RTTI is intentionally on. nlohmann::json compiles fine with or
+# without it but cpp-httplib's exception path uses typeid lookups,
+# and we share libc++_shared.so with Apple's libs which were also
+# built with RTTI. Disabling here would split the runtime.
 
 # Our vendored `linker64` is from an older Android build that requires
 # DT_HASH and does not understand GNU-hash-only executables. NDK r23b's
@@ -83,18 +90,41 @@ target_link_options(main PRIVATE
     -Wl,--hash-style=both
 )
 
-# Phase 0: the daemon does NOT yet link against Apple's libs. That comes in
-# Phase 1 once we have the C++ symbol bindings written. LIBS_DIR is forwarded
-# from the top level for use by future link scripts; we only validate it for
-# now, to fail fast if the build environment is missing libs.
-if(DEFINED LIBS_DIR)
-    if(NOT EXISTS "${LIBS_DIR}/libstoreservicescore.so")
-        message(WARNING
-            "LIBS_DIR='${LIBS_DIR}' has no libstoreservicescore.so. "
-            "This is fine for Phase 0 (no Apple-lib calls yet) but Phase 1 "
-            "will require tools/extract-libs.sh to be run first.")
-    endif()
+# -----------------------------------------------------------------------------
+# Apple native libraries (Phase 1)
+# -----------------------------------------------------------------------------
+# Apple's libstoreservicescore / libmediaplatform / libandroidappmusic
+# are NOT in the daemon's DT_NEEDED chain. The Loader (apple/loader.cpp)
+# resolves them at runtime via dlopen/dlsym, which means the daemon can
+# start in stub mode even when the Apple libs (and their AOSP closure)
+# are absent.
+#
+# We DO link against libc++_shared.so here so that the daemon's own
+# C++ runtime SONAME matches what Apple's libs expect. At runtime the
+# dynamic linker resolves "libc++_shared.so" against /system/lib64/
+# (set via -rpath below) so the same .so file backs both the daemon
+# and Apple's libs once they get dlopen'd.
+if(NOT DEFINED LIBS_DIR)
+    message(FATAL_ERROR
+        "LIBS_DIR is not set. The top-level CMakeLists.txt should pass "
+        "-DLIBS_DIR=<repo>/rootfs/system/lib64.")
 endif()
+
+if(NOT EXISTS "${LIBS_DIR}/libc++_shared.so")
+    message(FATAL_ERROR
+        "${LIBS_DIR}/libc++_shared.so is missing. Run tools/extract-libs.sh "
+        "first to populate rootfs/system/lib64/ from a verified APK bundle.")
+endif()
+
+target_link_libraries(main PRIVATE
+    "${LIBS_DIR}/libc++_shared.so"
+    log
+    dl
+)
+
+target_link_options(main PRIVATE
+    -Wl,-rpath,/system/lib64
+)
 
 set_target_properties(main PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
