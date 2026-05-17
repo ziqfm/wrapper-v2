@@ -2,7 +2,7 @@
 
 A clean rewrite of the Apple Music FairPlay decryption wrapper. Currently in
 **Phase 1.3** — same as 1.1, plus **`GET /playback`** (Phase 1.2) and **`POST /decrypt`**.
-**Phase 3** is done for **`arm64-v8a`** images (NDK + CI matrix on `ubuntu-24.04-arm`;
+**Phase 3** is done for **`arm64-v8a`** images (NDK cross-build + multi-arch Docker;
 see **Building** → arm64-v8a).
 
 ## What it is
@@ -140,19 +140,25 @@ on machines that already have something on `:80`.
 
 ### arm64-v8a image (Apple Silicon / AArch64 Linux)
 
-Use the same `.apkm`, but extract and stage **arm64-v8a**, then build with a **linux/arm64**
-base so the host `wrapper` and NDK output match the staged `linker64` / `.so` ABI:
+Use the same `.apkm`, but extract and stage **arm64-v8a**, then build a **linux/arm64**
+image so `wrapper`, the NDK daemon, and the staged `linker64` / `.so` set share the
+same ABI.
+
+The Docker **compile** stage is always **linux/amd64** (Google ships the Linux NDK as an
+x86_64-host ZIP only). The image then cross-compiles `wrapper` for AArch64 when
+`TARGET_ARCH=arm64-v8a`. Set **runtime** platform to arm64; `BUILD_PLATFORM` in Compose is
+ignored but kept for compatibility.
 
 ```bash
 tools/extract-libs.sh --bundle .tmp/bundle.apkm --arch arm64-v8a
 tools/stage-system.sh --arch arm64-v8a
 
-TARGET_ARCH=arm64-v8a \
-BUILD_PLATFORM=linux/arm64 RUNTIME_PLATFORM=linux/arm64 \
+TARGET_ARCH=arm64-v8a RUNTIME_PLATFORM=linux/arm64 \
   docker compose up --build
 ```
 
-Cross-building `linux/arm64` from an x86_64 host (`docker buildx` + QEMU) is possible but slow; prefer a native arm64 builder when you can.
+On an **x86_64** host, `docker compose` / `docker run` need **QEMU** (binfmt) to run a
+`linux/arm64` container. On an **arm64** host, run the image **natively** (no emulation).
 
 ### Daemon configuration
 
@@ -181,9 +187,9 @@ with one repository secret:
 
 - `APK_URL` - URL of the pinned `.apkm` (must match `LIBS_VERSION.json` → `apkm`)
 
-**Matrix:** `x86_64` on `ubuntu-latest` (amd64 image) and `arm64-v8a` on `ubuntu-24.04-arm`
-(arm64 image), with matching `BUILD_PLATFORM` / `RUNTIME_PLATFORM` so the launcher and
-daemon match the staged rootfs.
+**Matrix:** both `x86_64` and `arm64-v8a` jobs use `ubuntu-latest`. The arm64 image is
+`linux/arm64` at runtime; QEMU is enabled before the smoke `docker run` so the job works
+on amd64 GitHub runners. The compile stage stays **linux/amd64** for the official NDK ZIP.
 
 Pull requests opened from forks skip the build job (they cannot read the
 secret).
