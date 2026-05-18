@@ -92,6 +92,7 @@ struct Symbols {
     abi::fn_Data_bytes      Data_bytes      = nullptr;
 
     abi::fn_HTTPMessage_ctor        HTTPMessage_ctor        = nullptr;
+    abi::fn_HTTPMessage_ctor_c1     HTTPMessage_ctor_c1     = nullptr;  // arm64 fallback
     abi::fn_HTTPMessage_setHeader   HTTPMessage_setHeader   = nullptr;
     abi::fn_HTTPMessage_setBodyData HTTPMessage_setBodyData = nullptr;
 
@@ -187,8 +188,7 @@ struct Symbols {
     abi::fn_SVPlaybackLeaseManager_refreshLeaseAutomatically SVPlaybackLeaseManager_refreshLeaseAutomatically = nullptr;
     abi::fn_SVPlaybackLeaseManager_requestLease              SVPlaybackLeaseManager_requestLease              = nullptr;
     abi::fn_SVFootHillSessionCtrl_instance                   SVFootHillSessionCtrl_instance                   = nullptr;
-    abi::fn_SVFootHillSessionCtrl_getPersistentKey           SVFootHillSessionCtrl_getPersistentKey           = nullptr;
-    abi::fn_SVFootHillSessionCtrl_decryptContext             SVFootHillSessionCtrl_decryptContext             = nullptr;
+    abi::fn_SVFootHillSessionCtrl_decryptContext               SVFootHillSessionCtrl_decryptContext             = nullptr;
     abi::fn_SVFootHillPContext_kdContext                     SVFootHillPContext_kdContext                     = nullptr;
     abi::fn_fp_sample_decrypt                                fp_sample_decrypt                                = nullptr;
     abi::fn_SVFootHillSessionCtrl_resetAllContexts           SVFootHillSessionCtrl_resetAllContexts           = nullptr;
@@ -223,6 +223,18 @@ public:
     // Empty if no failure has been recorded.
     const std::string& last_error() const { return last_error_; }
 
+    // SVFootHillSessionCtrl::getPersistentKey — two possible ABIs; resolved in
+    // open(), dispatched with AArch64 sret thunks in loader.cpp.
+    void foot_hill_get_persistent_key(abi::shared_ptr* ret,
+                                      void*             foothill_instance,
+                                      abi::std_string*  adam_id,
+                                      abi::std_string*  key_uri,
+                                      abi::std_string*  key_format,
+                                      abi::std_string*  key_format_ver,
+                                      abi::std_string*  server_uri,
+                                      abi::std_string*  protocol_type,
+                                      abi::std_string*  fps_cert) const;
+
 private:
     void* h_libstoreservicescore_ = nullptr;
     void* h_libmediaplatform_     = nullptr;
@@ -234,6 +246,9 @@ private:
     bool        ok_{false};
     bool        fairplay_decrypt_available_{false};
     std::string last_error_;
+
+    void* foot_hill_persistent_key_fn_   = nullptr;
+    bool  foot_hill_persistent_key_abi8_ = false;
 };
 
 }  // namespace wrapper::apple

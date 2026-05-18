@@ -68,6 +68,8 @@ void on_crash(int sig, siginfo_t* info, void* ctx) {
     void* rip = nullptr;
 #ifdef __x86_64__
     if (uc) rip = reinterpret_cast<void*>(uc->uc_mcontext.gregs[REG_RIP]);
+#elif defined(__aarch64__)
+    if (uc) rip = reinterpret_cast<void*>(uc->uc_mcontext.pc);
 #endif
     char buf[128];
     int n = snprintf(buf, sizeof(buf),
@@ -183,6 +185,16 @@ void maybe_auto_login_from_env(wrapper::apple::Account& account,
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Force unbuffered stderr so any prints made before a SIGSEGV are visible.
+    // Bionic typically does this already, but be defensive — we have lost
+    // diagnostics to flushing before, especially on aarch64 where DT_INIT
+    // crashes during dlopen kill the process before fclose() runs.
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+
+    std::fprintf(stderr,
+                 "wrapper-v2: daemon starting (argv0=%s, pid=%ld)\n",
+                 argc > 0 ? argv[0] : "?", static_cast<long>(getpid()));
+
     if (!consume_argv(argc, argv)) {
         return 0;
     }
@@ -198,7 +210,7 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, on_signal);
     std::signal(SIGPIPE, SIG_IGN);
 
-    // Install crash handler for a single stderr line with fault_addr + rip.
+    // Install crash handler for a single stderr line with fault_addr + PC/RIP.
     {
         struct sigaction sa{};
         sa.sa_sigaction = on_crash;
@@ -218,17 +230,33 @@ int main(int argc, char** argv) {
     std::string libs_dir = env_or("WRAPPER_LIBS_DIR", "/system/lib64");
 
     if (info.apple_init_enabled) {
+        std::fprintf(stderr, "wrapper-v2: opening Apple libs from %s\n",
+                     libs_dir.c_str());
         if (loader.open(libs_dir)) {
+            std::fprintf(stderr, "wrapper-v2: loader.open ok\n");
             wrapper::apple::RuntimeConfig rcfg;
             rcfg.base_dir    = env_or("WRAPPER_BASE_DIR",    rcfg.base_dir);
             rcfg.device_info = env_or("WRAPPER_DEVICE_INFO", rcfg.device_info);
+            std::fprintf(stderr, "wrapper-v2: runtime.initialize start\n");
             if (runtime.initialize(loader, rcfg)) {
+                std::fprintf(stderr, "wrapper-v2: runtime.initialize ok\n");
                 if (env_bool("WRAPPER_RESTORE_SESSION", true)) {
-                    if (account.try_restore_cached_session(loader, runtime)) {
+                    std::fprintf(stderr,
+                                 "wrapper-v2: try_restore_cached_session start\n");
+                    const bool restored =
+                        account.try_restore_cached_session(loader, runtime);
+                    std::fprintf(stderr,
+                                 "wrapper-v2: try_restore_cached_session ok "
+                                 "(restored=%d)\n", restored ? 1 : 0);
+                    if (restored) {
                         std::fprintf(stderr,
                                      "wrapper-v2: session restored from Apple cache "
                                      "(GET /me without POST /login)\n");
                     }
+                } else {
+                    std::fprintf(stderr,
+                                 "wrapper-v2: WRAPPER_RESTORE_SESSION=0, skipping "
+                                 "cached session probe\n");
                 }
             } else {
                 std::fprintf(stderr,
@@ -249,13 +277,17 @@ int main(int argc, char** argv) {
                      "(stub mode: /health only; POST /login returns 503)\n");
     }
 
+    std::fprintf(stderr, "wrapper-v2: maybe_auto_login_from_env start\n");
     maybe_auto_login_from_env(account, loader, runtime, info.apple_init_enabled);
+    std::fprintf(stderr, "wrapper-v2: maybe_auto_login_from_env ok\n");
 
     httplib::Server svr;
     g_server.store(&svr);
 
+    std::fprintf(stderr, "wrapper-v2: server.mount start\n");
     wrapper::Server server(svr, runtime, loader, account, info);
     server.mount();
+    std::fprintf(stderr, "wrapper-v2: server.mount ok\n");
 
     std::fprintf(stderr, "wrapper-v2: %s listening on %s:%d\n", kVersion,
                  listen_host.c_str(), listen_port);

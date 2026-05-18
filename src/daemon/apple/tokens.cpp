@@ -1,7 +1,9 @@
 #include "apple/tokens.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -9,6 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "apple/aarch64_sret_thunks.hpp"
 #include "apple/auth.hpp"
 #include "apple/loader.hpp"
 
@@ -97,14 +100,25 @@ std::string read_std_string(const abi::std_string& s) {
 }
 
 // HTTPMessage: manual __shared_ptr_emplace layout; +32 is the HTTPMessage
-// object. Buffer is oversized vs the old 480-byte guess — Release-only
-// crashes often meant heap/stack corruption when the real object grew.
+// object. The emplace/control-block storage must outlive this C++ stack frame:
+// URLRequest / HTTPRequest can keep shared/weak references after run() returns,
+// and a later request may release them. If this storage lives on the stack, the
+// second token request can end up touching a reused/zeroed control block and
+// crash through a null vtable (arm64 commonly reports fault_addr=0x10).
 struct HTTPMessageHolder {
-    alignas(16) std::uint8_t buf[2048];
+    static constexpr std::size_t kSize = 4096;
+    std::uint8_t* buf = nullptr;
     abi::shared_ptr sp{};
 
     void init(void** vtable) {
-        std::memset(buf, 0, sizeof(buf));
+        void* raw = nullptr;
+        if (::posix_memalign(&raw, 16, kSize) != 0 || raw == nullptr) {
+            std::fprintf(stderr, "tokens: HTTPMessageHolder allocation failed\n");
+            std::fflush(stderr);
+            std::abort();
+        }
+        buf = static_cast<std::uint8_t*>(raw);
+        std::memset(buf, 0, kSize);
         *reinterpret_cast<void**>(buf) = vtable + 2;
         sp.obj      = buf + 32;
         sp.ctrl_blk = buf;
@@ -157,6 +171,20 @@ void set_url_param(const Symbols& s, void* url_req_obj,
     s.URLRequest_setRequestParameter(url_req_obj, &n, &v);
 }
 
+void construct_http_message(const Symbols& s,
+                            HTTPMessageHolder& msg,
+                            const char* url,
+                            const char* method) {
+    // HTTPMessage(url, method) takes std::string by value. Use real
+    // std::string temporaries so libc++ constructs/destructs valid objects
+    // instead of treating an abi::std_string view as an owned string.
+    if (s.HTTPMessage_ctor_c1 != nullptr) {
+        s.HTTPMessage_ctor_c1(msg.sp.obj, std::string(url), std::string(method));
+    } else {
+        s.HTTPMessage_ctor(msg.sp.obj, std::string(url), std::string(method));
+    }
+}
+
 struct UrlRequestResult {
     std::string body;
     int  error_code = 0;
@@ -174,15 +202,24 @@ UrlRequestResult run_request(
         const std::vector<std::pair<std::string, std::string>>& params) {
     UrlRequestResult r;
 
-    alignas(16) static thread_local std::uint8_t url_req[4096];
-    std::memset(url_req, 0, sizeof(url_req));
+    // Process-lifetime storage: URLRequest/HTTPRequest can retain references
+    // beyond run(), so do not back this with a stack buffer.
+    constexpr std::size_t kUrlReqSize = 8192;
+    void* url_req_raw = nullptr;
+    if (::posix_memalign(&url_req_raw, 16, kUrlReqSize) != 0 || url_req_raw == nullptr) {
+        std::fprintf(stderr, "tokens: run_request: posix_memalign failed\n");
+        std::fflush(stderr);
+        return r;
+    }
+    std::uint8_t* url_req = static_cast<std::uint8_t*>(url_req_raw);
+    std::memset(url_req, 0, kUrlReqSize);
     s.URLRequest_ctor(url_req, &msg.sp, &req_ctx);
 
     for (const auto& p : params) {
         set_url_param(s, url_req, p.first.c_str(), p.second.c_str());
     }
 
-    s.URLRequest_run(url_req);
+    aarch64_sret::urlrequest_run(url_req, s.URLRequest_run);
 
     abi::shared_ptr* err = s.URLRequest_error(url_req);
     if (err != nullptr && err->obj != nullptr) {
@@ -215,12 +252,12 @@ std::string post_json(const Symbols& s,
                       abi::shared_ptr req_ctx,
                       HTTPMessageHolder& msg,
                       const std::string& body_json) {
-    // Body buffer must stay alive until URLRequest_run finishes — setBodyData
-    // keeps the pointer, it does not copy (Release will crash if we free early).
-    std::vector<char> storage;
+    // Upstream uses a malloc'd + snprintf buffer and frees immediately after
+    // setBodyData. libc++ std::string::data() is null-terminated, so we pass
+    // the std::string buffer directly instead of copying into std::vector<char>
+    // (which is NOT null-terminated and may cause strlen-based corruption).
     if (!body_json.empty()) {
-        storage.assign(body_json.begin(), body_json.end());
-        s.HTTPMessage_setBodyData(msg.sp.obj, storage.data(), storage.size());
+        s.HTTPMessage_setBodyData(msg.sp.obj, body_json.data(), body_json.size());
     }
     auto r = run_request(s, req_ctx, msg, {});
     if (!r.ok) return {};
@@ -232,7 +269,8 @@ std::string post_json(const Symbols& s,
 std::string harvest_storefront(const Symbols& s, abi::shared_ptr req_ctx) {
     abi::std_string out{};
     abi::shared_ptr null_url_bag{};
-    s.RequestContext_storeFrontIdentifier(&out, req_ctx.obj, &null_url_bag);
+    aarch64_sret::request_context_store_front_identifier(
+        &out, req_ctx.obj, &null_url_bag, s.RequestContext_storeFrontIdentifier);
     return read_std_string(out);
 }
 
@@ -242,7 +280,7 @@ std::string device_guid_string(const Symbols& s, abi::shared_ptr device_guid) {
     // hidden first arg. The first 8 bytes are the Data* whose bytes()
     // we want.
     void* ret[2] = {nullptr, nullptr};
-    s.DeviceGUID_guid(ret, device_guid.obj);
+    aarch64_sret::device_guid_guid(ret, device_guid.obj, s.DeviceGUID_guid);
     if (ret[0] == nullptr) return {};
     const char* bytes = s.Data_bytes(ret[0]);
     if (bytes == nullptr) return {};
@@ -253,9 +291,9 @@ std::string harvest_dev_token(const Symbols& s, abi::shared_ptr req_ctx) {
     // Matches upstream get_dev_token(): GET + query params; JSON field is "token".
     HTTPMessageHolder msg;
     msg.init(s.vtable_HTTPMessage);
-    auto url    = abi::make_string_view("https://sf-api-token-service.itunes.apple.com/apiToken");
-    auto method = abi::make_string_view("GET");
-    s.HTTPMessage_ctor(msg.sp.obj, &url, &method);
+    construct_http_message(s, msg,
+                           "https://sf-api-token-service.itunes.apple.com/apiToken",
+                           "GET");
 
     std::vector<std::pair<std::string, std::string>> params;
     params.emplace_back("clientId", "musicAndroid");
@@ -278,10 +316,10 @@ std::string harvest_music_user_token(const Symbols& s,
                                      const std::string& dev_token) {
     HTTPMessageHolder msg;
     msg.init(s.vtable_HTTPMessage);
-    auto url    = abi::make_string_view(
-        "https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/createMusicToken");
-    auto method = abi::make_string_view("POST");
-    s.HTTPMessage_ctor(msg.sp.obj, &url, &method);
+    construct_http_message(s, msg,
+                           "https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/createMusicToken",
+                           "POST");
+
     set_str_header(s, msg.sp.obj, "Content-Type", "application/json; charset=UTF-8");
     set_str_header(s, msg.sp.obj, "Expect", "");
     set_str_header(s, msg.sp.obj, "X-Apple-Requesting-Bundle-Id", "com.apple.android.music");

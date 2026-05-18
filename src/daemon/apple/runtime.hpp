@@ -101,7 +101,9 @@ private:
     std::string device_info_;
 
     std::mutex         playback_mutex_;
-    alignas(16) unsigned char lease_mgr_[16]{};
+    // Placement buffer for SVPlaybackLeaseManager (ctor + instance methods).
+    // Must cover the real object size; 16 was far too small and UB on arm64.
+    alignas(16) unsigned char lease_mgr_[4096]{};
     void*    foothill_         = nullptr;
     bool     playback_ready_  = false;
 };

@@ -1,6 +1,9 @@
 #include "apple/loader.hpp"
 
+#include "apple/aarch64_sret_thunks.hpp"
+
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 
@@ -8,8 +11,33 @@ namespace wrapper::apple {
 
 namespace {
 
+// Mirrors WRAPPER_RUNTIME_TRACE in runtime.cpp: when set to any non-empty
+// non-"0" value, the loader prints a single stderr line before each dlopen /
+// dlsym group so a SIGSEGV inside DT_INIT_ARRAY (or a missing symbol) can be
+// localized to the exact library / phase. Stays off by default since the
+// per-call tracing is verbose.
+bool loader_trace_enabled() {
+    static const bool v = []() {
+        const char* x = std::getenv("WRAPPER_RUNTIME_TRACE");
+        if (x == nullptr || *x == '\0') return false;
+        if (std::strcmp(x, "0") == 0) return false;
+        return true;
+    }();
+    return v;
+}
+
+void trace(const char* stage) {
+    if (!loader_trace_enabled()) return;
+    std::fprintf(stderr, "loader: trace %s\n", stage);
+    std::fflush(stderr);
+}
+
 // Helper: dlopen with friendlier error reporting.
 void* open_lib(const std::string& path, std::string* err_out) {
+    if (loader_trace_enabled()) {
+        std::fprintf(stderr, "loader: dlopen %s ...\n", path.c_str());
+        std::fflush(stderr);
+    }
     void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (h == nullptr) {
         const char* msg = dlerror();
@@ -17,16 +45,26 @@ void* open_lib(const std::string& path, std::string* err_out) {
             *err_out = "dlopen(" + path + "): " + (msg ? msg : "unknown error");
         }
         std::fprintf(stderr, "loader: %s\n", err_out ? err_out->c_str() : "");
+    } else if (loader_trace_enabled()) {
+        std::fprintf(stderr, "loader: dlopen %s -> %p\n", path.c_str(), h);
+        std::fflush(stderr);
     }
     return h;
 }
 
 void* open_lib_optional(const std::string& path) {
+    if (loader_trace_enabled()) {
+        std::fprintf(stderr, "loader: dlopen(optional) %s ...\n", path.c_str());
+        std::fflush(stderr);
+    }
     void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (h == nullptr) {
         const char* msg = dlerror();
         std::fprintf(stderr, "loader: optional dlopen %s: %s\n", path.c_str(),
                      msg ? msg : "?");
+    } else if (loader_trace_enabled()) {
+        std::fprintf(stderr, "loader: dlopen(optional) %s -> %p\n", path.c_str(), h);
+        std::fflush(stderr);
     }
     return h;
 }
@@ -70,7 +108,6 @@ void clear_fairplay_symbols(Symbols* s) {
     s->SVPlaybackLeaseManager_refreshLeaseAutomatically = nullptr;
     s->SVPlaybackLeaseManager_requestLease              = nullptr;
     s->SVFootHillSessionCtrl_instance                   = nullptr;
-    s->SVFootHillSessionCtrl_getPersistentKey           = nullptr;
     s->SVFootHillSessionCtrl_decryptContext             = nullptr;
     s->SVFootHillPContext_kdContext                     = nullptr;
     s->fp_sample_decrypt                                = nullptr;
@@ -92,20 +129,26 @@ bool Loader::open(const std::string& libs_dir) {
     //
     // Pre-load FairPlay helpers first so SVFootHill symbols resolve (some
     // builds only export the chain once CoreFP/CoreLSKD are in the process).
+    trace("dlopen libCoreFP.so (optional)");
     h_libcorefp_   = open_lib_optional(libs_dir + "/libCoreFP.so");
+    trace("dlopen libCoreLSKD.so (optional)");
     h_libcorelskd_ = open_lib_optional(libs_dir + "/libCoreLSKD.so");
 
     // Match upstream CMake link order: androidappmusic, storeservicescore,
     // mediaplatform (after cxx). Dependencies still resolve transitively.
+    trace("dlopen libandroidappmusic.so");
     if (!load(libs_dir + "/libandroidappmusic.so",   &h_libandroidappmusic_)) {
         return false;
     }
+    trace("dlopen libstoreservicescore.so");
     if (!load(libs_dir + "/libstoreservicescore.so", &h_libstoreservicescore_)) {
         return false;
     }
+    trace("dlopen libmediaplatform.so");
     if (!load(libs_dir + "/libmediaplatform.so",     &h_libmediaplatform_)) {
         return false;
     }
+    trace("all core libs loaded; starting symbol resolution");
 
     using namespace abi;
 
@@ -193,6 +236,15 @@ bool Loader::open(const std::string& libs_dir) {
     RESOLVE(Data_bytes,      Data_bytes);
 
     RESOLVE(HTTPMessage_ctor,        HTTPMessage_ctor);
+    // C1 is optional: arm64 builds may need the complete-object ctor
+    // when HTTPMessage has virtual bases.  If it’s absent we fall back to C2.
+    {
+        dlerror();
+        void* sym = dlsym(RTLD_DEFAULT, abi::mangled::HTTPMessage_ctor_c1);
+        if (sym != nullptr && dlerror() == nullptr) {
+            symbols_.HTTPMessage_ctor_c1 = reinterpret_cast<abi::fn_HTTPMessage_ctor_c1>(sym);
+        }
+    }
     RESOLVE(HTTPMessage_setHeader,   HTTPMessage_setHeader);
     RESOLVE(HTTPMessage_setBodyData, HTTPMessage_setBodyData);
 
@@ -305,8 +357,23 @@ bool Loader::open(const std::string& libs_dir) {
                         SVPlaybackLeaseManager_refreshLeaseAutomatically);
     fp_ok &= RESOLVE_FP(SVPlaybackLeaseManager_requestLease, SVPlaybackLeaseManager_requestLease);
     fp_ok &= RESOLVE_FP(SVFootHillSessionCtrl_instance, SVFootHillSessionCtrl_instance);
-    fp_ok &= RESOLVE_FP(SVFootHillSessionCtrl_getPersistentKey,
-                        SVFootHillSessionCtrl_getPersistentKey);
+    foot_hill_persistent_key_fn_   = nullptr;
+    foot_hill_persistent_key_abi8_ = false;
+    {
+        abi::fn_SVFootHillSessionCtrl_getPersistentKey  pk8 = nullptr;
+        abi::fn_SVFootHillSessionCtrl_getPersistentKey7 pk7 = nullptr;
+        bool                                              pk  = false;
+        if (resolve_fp(mangled::SVFootHillSessionCtrl_getPersistentKey_8str, &pk8)) {
+            foot_hill_persistent_key_fn_   = reinterpret_cast<void*>(pk8);
+            foot_hill_persistent_key_abi8_ = true;
+            pk                             = true;
+        } else if (resolve_fp(mangled::SVFootHillSessionCtrl_getPersistentKey_7str, &pk7)) {
+            foot_hill_persistent_key_fn_   = reinterpret_cast<void*>(pk7);
+            foot_hill_persistent_key_abi8_ = false;
+            pk                             = true;
+        }
+        fp_ok &= pk;
+    }
     fp_ok &= RESOLVE_FP(SVFootHillSessionCtrl_decryptContext,
                         SVFootHillSessionCtrl_decryptContext);
     fp_ok &= RESOLVE_FP(SVFootHillPContext_kdContext, SVFootHillPContext_kdContext);
@@ -318,8 +385,18 @@ bool Loader::open(const std::string& libs_dir) {
 
 #undef RESOLVE_FP
 
+    if (foot_hill_persistent_key_fn_ != nullptr) {
+        std::fprintf(stderr,
+                     "loader: FairPlay getPersistentKey ABI=%s fn=%p\n",
+                     foot_hill_persistent_key_abi8_ ? "8-string" : "7-string",
+                     foot_hill_persistent_key_fn_);
+        std::fflush(stderr);
+    }
+
     if (!fp_ok) {
         clear_fairplay_symbols(&symbols_);
+        foot_hill_persistent_key_fn_   = nullptr;
+        foot_hill_persistent_key_abi8_ = false;
         fairplay_decrypt_available_ = false;
         std::fprintf(stderr,
                      "loader: FairPlay decrypt symbols unavailable (%s); "
@@ -338,11 +415,38 @@ void Loader::close() {
     ok_                       = false;
     fairplay_decrypt_available_ = false;
     symbols_                  = Symbols{};
+    foot_hill_persistent_key_fn_   = nullptr;
+    foot_hill_persistent_key_abi8_ = false;
     h_libstoreservicescore_   = nullptr;
     h_libmediaplatform_       = nullptr;
     h_libandroidappmusic_     = nullptr;
     h_libcorefp_              = nullptr;
     h_libcorelskd_            = nullptr;
+}
+
+void Loader::foot_hill_get_persistent_key(abi::shared_ptr* ret,
+                                          void*            foothill_instance,
+                                          abi::std_string* adam_id,
+                                          abi::std_string* key_uri,
+                                          abi::std_string* key_format,
+                                          abi::std_string* key_format_ver,
+                                          abi::std_string* server_uri,
+                                          abi::std_string* protocol_type,
+                                          abi::std_string* fps_cert) const {
+    if (foot_hill_persistent_key_fn_ == nullptr) return;
+    if (foot_hill_persistent_key_abi8_) {
+        auto* fn = reinterpret_cast<abi::fn_SVFootHillSessionCtrl_getPersistentKey>(
+            foot_hill_persistent_key_fn_);
+        aarch64_sret::svfoot_get_persistent_key(
+            ret, foothill_instance, adam_id, adam_id, key_uri, key_format,
+            key_format_ver, server_uri, protocol_type, fps_cert, fn);
+    } else {
+        auto* fn = reinterpret_cast<abi::fn_SVFootHillSessionCtrl_getPersistentKey7>(
+            foot_hill_persistent_key_fn_);
+        aarch64_sret::svfoot_get_persistent_key_7str(
+            ret, foothill_instance, adam_id, key_uri, key_format,
+            key_format_ver, server_uri, protocol_type, fps_cert, fn);
+    }
 }
 
 }  // namespace wrapper::apple

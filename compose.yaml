@@ -21,6 +21,9 @@ services:
     environment:
       WRAPPER_USERNAME: ${WRAPPER_USERNAME:-}
       WRAPPER_PASSWORD: ${WRAPPER_PASSWORD:-}
+      WRAPPER_APPLE_INIT: ${WRAPPER_APPLE_INIT:-}
+      WRAPPER_RUNTIME_TRACE: ${WRAPPER_RUNTIME_TRACE:-}
+      WRAPPER_SKIP_PLAYBACK_INIT: ${WRAPPER_SKIP_PLAYBACK_INIT:-}
     volumes:
       # Persist Apple state at the same path shape as the Android app sandbox.
       - ./data:/app/rootfs/data/data/com.apple.android.music/files

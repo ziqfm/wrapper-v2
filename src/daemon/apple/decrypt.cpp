@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "apple/fairplay_cert.inc"
+#include "apple/aarch64_sret_thunks.hpp"
 #include "apple/loader.hpp"
 #include "apple/runtime.hpp"
 
@@ -71,10 +72,10 @@ DecryptResult decrypt_samples(const Loader& loader,
         auto        fps_cert   = abi::make_string_view(kFairPlayCert);
 
         abi::shared_ptr persist{};
-        // Same as zhaarey/apple-music-downloader agent.js (7 string args after this).
-        s.SVFootHillSessionCtrl_getPersistentKey(
-            &persist, fh, &default_id, &uri, &key_format, &key_ver, &server_uri, &protocol,
-            &fps_cert);
+        loader.foot_hill_get_persistent_key(
+            &persist, fh,
+            &default_id, &uri, &key_format, &key_ver,
+            &server_uri, &protocol, &fps_cert);
 
         if (persist.obj == nullptr) {
             out.error = "getPersistentKey failed (key or lease?)";
@@ -82,7 +83,8 @@ DecryptResult decrypt_samples(const Loader& loader,
         }
 
         abi::shared_ptr sv_ctx{};
-        s.SVFootHillSessionCtrl_decryptContext(&sv_ctx, fh, persist.obj);
+        aarch64_sret::svfoot_decrypt_context(&sv_ctx, fh, persist.obj,
+                                            s.SVFootHillSessionCtrl_decryptContext);
 
         if (sv_ctx.obj == nullptr) {
             out.error = "decryptContext failed";

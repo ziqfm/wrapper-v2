@@ -188,7 +188,22 @@ int main(int argc, char* argv[], char* envp[]) {
     setenv("CURL_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt", 0);
 
     /* Pass environ so setenv() changes are visible (execve's envp is static). */
-    execve(DAEMON_PATH, argv, environ);
+    /* execve leaves argv[0] as the host path (e.g. /app/wrapper); set argv[0]
+     * to the daemon so bionic diagnostics and any argv[0]-based logic match. */
+    const int max_args = 256;
+    if (argc >= max_args) {
+        fprintf(stderr, "wrapper: too many arguments (%d max)\n", max_args - 1);
+        return 1;
+    }
+    char* fixed_argv[max_args + 1];
+    fixed_argv[0] = (char*)DAEMON_PATH;
+    for (int i = 1; i < argc; ++i) {
+        fixed_argv[i] = argv[i];
+    }
+    /* argv list must be NULL-terminated (C null pointer, not C++ nullptr). */
+    fixed_argv[argc > 0 ? argc : 1] = 0;
+
+    execve(DAEMON_PATH, fixed_argv, environ);
     fprintf(stderr, "wrapper: execve %s: %s\n", DAEMON_PATH, strerror(errno));
     return 1;
 }

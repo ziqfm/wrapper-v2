@@ -26,6 +26,7 @@
 #include <sstream>
 #include <string>
 
+#include "apple/aarch64_sret_thunks.hpp"
 #include "apple/auth.hpp"
 
 namespace wrapper::apple {
@@ -33,6 +34,34 @@ namespace wrapper::apple {
 namespace {
 
 constexpr int kDeviceInfoPartCount = 9;
+
+// Stage tracing: writes a single stderr line and flushes so the line is on
+// disk before the next Apple call. Gated on WRAPPER_RUNTIME_TRACE=1 (or the
+// env var being any non-empty non-"0" value).
+bool runtime_trace_enabled() {
+    static const bool v = []() {
+        const char* x = std::getenv("WRAPPER_RUNTIME_TRACE");
+        if (x == nullptr || *x == '\0') return false;
+        if (std::strcmp(x, "0") == 0) return false;
+        return true;
+    }();
+    return v;
+}
+
+void trace(const char* stage) {
+    if (!runtime_trace_enabled()) return;
+    std::fprintf(stderr, "runtime: trace %s\n", stage);
+    std::fflush(stderr);
+}
+
+// Allow skipping playback init via WRAPPER_SKIP_PLAYBACK_INIT=1 so users can
+// confirm whether SVPlaybackLeaseManager_ctor is the SIGSEGV source.
+bool skip_playback_init() {
+    const char* x = std::getenv("WRAPPER_SKIP_PLAYBACK_INIT");
+    if (x == nullptr || *x == '\0') return false;
+    if (std::strcmp(x, "0") == 0) return false;
+    return true;
+}
 
 void end_lease_cb(const int& code) {
     std::fprintf(stderr, "runtime: playback lease ended (code=%d)\n", code);
@@ -216,17 +245,23 @@ Runtime& Runtime::instance() {
 }
 
 bool Runtime::init_playback_session(const Symbols& s) {
+    trace("init_playback_session: memset lease_mgr_");
     std::memset(lease_mgr_, 0, sizeof(lease_mgr_));
+    trace("init_playback_session: SVPlaybackLeaseManager_ctor");
     s.SVPlaybackLeaseManager_ctor(lease_mgr_, &g_end_lease_fn, &g_pb_err_fn);
     std::uint8_t autom = 1;
+    trace("init_playback_session: refreshLeaseAutomatically");
     s.SVPlaybackLeaseManager_refreshLeaseAutomatically(lease_mgr_, &autom);
+    trace("init_playback_session: requestLease");
     s.SVPlaybackLeaseManager_requestLease(lease_mgr_, &autom);
+    trace("init_playback_session: SVFootHillSessionCtrl::instance");
     foothill_ = s.SVFootHillSessionCtrl_instance();
     if (foothill_ == nullptr) {
         std::fprintf(stderr,
                      "runtime: SVFootHillSessionCtrl::instance returned null\n");
         return false;
     }
+    trace("init_playback_session: done");
     return true;
 }
 
@@ -263,15 +298,24 @@ bool Runtime::initialize(const Loader& loader, const RuntimeConfig& cfg) {
     }
 
     const Symbols& s = loader.sym();
+    trace("initialize: init_dns_and_foothill");
     if (!init_dns_and_foothill(s, parts)) return false;
+    trace("initialize: init_request_context");
     if (!init_request_context(s, cfg, parts)) return false;
+    trace("initialize: init_presentation_interface");
     if (!init_presentation_interface(s)) return false;
+    trace("initialize: core context ready");
 
     base_dir_    = cfg.base_dir;
     device_info_ = cfg.device_info;
     loader_      = &loader;
 
-    if (!loader.fairplay_decrypt_available()) {
+    if (skip_playback_init()) {
+        playback_ready_ = false;
+        std::fprintf(stderr,
+                     "runtime: WRAPPER_SKIP_PLAYBACK_INIT set; skipping playback "
+                     "session init (POST /decrypt unavailable)\n");
+    } else if (!loader.fairplay_decrypt_available()) {
         playback_ready_ = false;
         std::fprintf(stderr,
                      "runtime: FairPlay decrypt chain not loaded; POST /decrypt unavailable\n");
@@ -294,16 +338,19 @@ bool Runtime::init_dns_and_foothill(const Symbols& s,
     // Bionic's resolver inside the chroot has no /etc/resolv.conf to
     // read. Set Alibaba's public DNS so the bundled libcurl can
     // reach api.itunes.apple.com etc. Upstream uses the same hosts.
+    trace("init_dns_and_foothill: resolv_set_nameservers_for_net");
     static const char* resolvers[2] = {"223.5.5.5", "223.6.6.6"};
     s.resolv_set_nameservers_for_net(0, resolvers, 2, ".");
 
     // FootHillConfig::config(android_id). Android ID is part 8 of
     // the device-info tuple.
+    trace("init_dns_and_foothill: FootHillConfig::config");
     auto android_id = abi::make_string_view(parts[8].c_str());
     s.FootHillConfig_config(&android_id);
 
     // DeviceGUID::instance() -> shared_ptr<DeviceGUID>
-    s.DeviceGUID_instance(&device_guid_);
+    trace("init_dns_and_foothill: DeviceGUID::instance");
+    aarch64_sret::device_guid_instance(&device_guid_, s.DeviceGUID_instance);
     if (device_guid_.obj == nullptr) {
         std::fprintf(stderr, "runtime: DeviceGUID::instance returned null\n");
         return false;
@@ -312,12 +359,17 @@ bool Runtime::init_dns_and_foothill(const Symbols& s,
     // DeviceGUID::configure(android_id, "", 29, true). The first arg
     // is the hidden return slot for the (88-byte) Configuration<>
     // value Apple discards.
-    static std::uint8_t cfg_ret[88];
+    // Hidden return for DeviceGUID::configure; must be 16-byte aligned for
+    // AArch64 NEON / libc++ stores into the sret slot.
+    alignas(16) static std::uint8_t cfg_ret[88];
     static const unsigned int cfg_kind = 29;
     static const std::uint8_t cfg_flag = 1;
     auto empty = abi::make_string_view("");
-    s.DeviceGUID_configure(&cfg_ret, device_guid_.obj,
-                           &android_id, &empty, &cfg_kind, &cfg_flag);
+    trace("init_dns_and_foothill: DeviceGUID::configure");
+    aarch64_sret::device_guid_configure(
+        &cfg_ret, device_guid_.obj, &android_id, &empty, &cfg_kind, &cfg_flag,
+        s.DeviceGUID_configure);
+    trace("init_dns_and_foothill: done");
 
     return true;
 }
@@ -328,7 +380,9 @@ bool Runtime::init_request_context(const Symbols& s,
     // make_shared<RequestContext>(mpl_db_path).
     std::string mpl_db = cfg.base_dir + "/mpl_db";
     auto mpl_db_view = abi::make_string_view(mpl_db.c_str());
-    s.make_shared_RequestContext(&request_ctx_, &mpl_db_view);
+    trace("init_request_context: make_shared<RequestContext>");
+    aarch64_sret::make_shared_request_context(&request_ctx_, &mpl_db_view,
+                                             s.make_shared_RequestContext);
 
     if (request_ctx_.obj == nullptr) {
         std::fprintf(stderr, "runtime: make_shared<RequestContext> returned null\n");
@@ -347,9 +401,11 @@ bool Runtime::init_request_context(const Symbols& s,
     rcc.obj = rcc_buf + 32;
     rcc.ctrl_blk = rcc_buf;
 
+    trace("init_request_context: RequestContextConfig_ctor");
     s.RequestContextConfig_ctor(rcc.obj);
 
     // Setters: order matches upstream init_ctx().
+    trace("init_request_context: RCC setters");
     s.RCC_setBaseDirectoryPath(rcc.obj, &mpl_db_view);
 
     auto s0 = abi::make_string_view(parts[0].c_str());
@@ -377,34 +433,46 @@ bool Runtime::init_request_context(const Symbols& s,
     s.RCC_setLanguageIdentifier(rcc.obj, &s7);
 
     // Wire the RequestContext into the singleton manager.
+    trace("init_request_context: RequestContextManager::configure");
     s.RequestContextManager_configure(&request_ctx_);
 
     // RequestContext::init(rcc). Upstream uses an 88-byte hidden
     // return slot - match it.
-    static std::uint8_t rci_ret[88];
-    s.RequestContext_init(&rci_ret, request_ctx_.obj, &rcc);
+    // RequestContext::init hidden return buffer (same alignment as cfg_ret).
+    alignas(16) static std::uint8_t rci_ret[88];
+    trace("init_request_context: RequestContext::init");
+    aarch64_sret::request_context_init(&rci_ret, request_ctx_.obj, &rcc,
+                                       s.RequestContext_init);
 
     auto fp_dir = abi::make_string_view(cfg.base_dir.c_str());
+    trace("init_request_context: setFairPlayDirectoryPath");
     s.RequestContext_setFairPlayDirectoryPath(request_ctx_.obj, &fp_dir);
 
+    trace("init_request_context: done");
     return true;
 }
 
 bool Runtime::init_presentation_interface(const Symbols& s) {
     // make_shared<AndroidPresentationInterface>()
-    s.make_shared_AndroidPresentationInterface(&presentation_interface_);
+    trace("init_presentation_interface: make_shared<AndroidPresentationInterface>");
+    aarch64_sret::make_shared_android_presentation_interface(
+        &presentation_interface_, s.make_shared_AndroidPresentationInterface);
     if (presentation_interface_.obj == nullptr) {
         std::fprintf(stderr,
                      "runtime: make_shared<AndroidPresentationInterface> returned null\n");
         return false;
     }
 
+    trace("init_presentation_interface: setDialogHandler");
     s.API_setDialogHandler(presentation_interface_.obj, &wrapper_dialog_handler);
+    trace("init_presentation_interface: setCredentialsHandler");
     s.API_setCredentialsHandler(presentation_interface_.obj, &wrapper_credential_handler);
 
     // Wire the apInf into the RequestContext so AuthenticateFlow can
     // surface credential prompts back to us.
+    trace("init_presentation_interface: setPresentationInterface");
     s.RequestContext_setPresentationInterface(request_ctx_.obj, &presentation_interface_);
+    trace("init_presentation_interface: done");
     return true;
 }
 

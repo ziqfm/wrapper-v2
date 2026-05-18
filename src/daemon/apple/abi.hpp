@@ -1,4 +1,9 @@
-// Apple Music native-lib ABI bindings (x86_64, APK 3.6.0-beta).
+// Apple Music native-lib ABI bindings (x86_64 / arm64-v8a, APK 3.6.0-beta).
+//
+// Returning C++ objects by value from Apple code uses a hidden first parameter
+// (struct-return / sret). On x86_64 that slot is the first C argument; on
+// AArch64 it is passed in x8 while `this` stays in x0. Plain C calls into those
+// entry points break on arm64 — use aarch64_sret_thunks.hpp helpers there.
 //
 // We call into Apple's libstoreservicescore / libmediaplatform /
 // libandroidappmusic by way of the Itanium-mangled C++ symbols they
@@ -25,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 namespace wrapper::apple::abi {
 
@@ -275,9 +281,20 @@ using fn_Data_bytes = const char* (*)(void* this_);
 // to our RequestContext (so it gets signed with DSID + X-Token), call
 // run(), then unwrap URLResponse -> underlyingResponse -> raw bytes.
 
-// HTTPMessage::HTTPMessage(string url, string method)
+// HTTPMessage::HTTPMessage(std::string url, std::string method)
+//
+// The mangled constructor takes both strings by value, not by const&.
+// Keep these as real std::string parameters so the compiler emits the
+// correct C++ ABI for non-trivial by-value arguments (caller-created
+// temporaries passed indirectly on AArch64). Passing abi::std_string* here
+// is only safe for const& symbols and can corrupt/free string literals.
 using fn_HTTPMessage_ctor =
-    void (*)(void* this_, std_string* url, std_string* method);
+    void (*)(void* this_, std::string url, std::string method);
+
+// C1 (complete object constructor) – used as a fallback on arm64 when
+// HTTPMessage has virtual bases that C2 does not initialise.
+using fn_HTTPMessage_ctor_c1 =
+    void (*)(void* this_, std::string url, std::string method);
 
 // HTTPMessage::setHeader(string name, string value)
 using fn_HTTPMessage_setHeader =
@@ -297,6 +314,9 @@ using fn_URLRequest_ctor =
 using fn_URLRequest_setRequestParameter =
     void (*)(void* this_, std_string* name, std_string* value);
 
+// URLRequest::run() returns void* on arm64 AAPCS (implicit sret struct return)
+// but void on x86_64. We declare as void since we ignore the return value, but
+// the calling convention differs on arm64 and might require sret thunk treatment.
 using fn_URLRequest_run      = void (*)(void* this_);
 using fn_URLRequest_error    = shared_ptr* (*)(void* this_);
 using fn_URLRequest_response = shared_ptr* (*)(void* this_);
@@ -402,7 +422,25 @@ using fn_SVPlaybackLeaseManager_requestLease               = void (*)(void* this
 
 using fn_SVFootHillSessionCtrl_instance = void* (*)();
 
+// getPersistentKey: Apple bumped the signature across Music app releases.
+// Itanium abbreviation S8_ is one trailing std::string const& per segment.
+//   - 7× S8_ after the first RK… = 8 string refs (adam, prefetch, uri, …).
+//     Used by zhaarey/apple-music-downloader agent-arm64.js and some APKs.
+//   - 6× S8_ = 7 string refs (no separate prefetch slot). Older libandroidappmusic.
+// Loader resolves whichever symbol exists; decrypt dispatches to the matching thunk.
 using fn_SVFootHillSessionCtrl_getPersistentKey =
+    void (*)(shared_ptr* ret,
+             void*       fh,
+             std_string* adam_id,
+             std_string* prefetch_adam_id,
+             std_string* key_uri,
+             std_string* key_format,
+             std_string* key_format_ver,
+             std_string* server_uri,
+             std_string* protocol_type,
+             std_string* fps_cert);
+
+using fn_SVFootHillSessionCtrl_getPersistentKey7 =
     void (*)(shared_ptr* ret,
              void*       fh,
              std_string* adam_id,
@@ -565,6 +603,8 @@ inline constexpr const char* vtable_HTTPMessage =
     "_ZTVNSt6__ndk120__shared_ptr_emplaceIN13mediaplatform11HTTPMessageENS_9allocatorIS2_EEEE";
 inline constexpr const char* HTTPMessage_ctor =
     "_ZN13mediaplatform11HTTPMessageC2ENSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES7_";
+inline constexpr const char* HTTPMessage_ctor_c1 =
+    "_ZN13mediaplatform11HTTPMessageC1ENSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES7_";
 inline constexpr const char* HTTPMessage_setHeader =
     "_ZN13mediaplatform11HTTPMessage9setHeaderERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES9_";
 inline constexpr const char* HTTPMessage_setBodyData =
@@ -626,9 +666,30 @@ inline constexpr const char* SVPlaybackLeaseManager_requestLease =
 inline constexpr const char* SVFootHillSessionCtrl_instance =
     "_ZN21SVFootHillSessionCtrl8instanceEv";
 
-// Must match `readelf --dyn-syms -W libandroidappmusic.so` exactly (dlsym is literal).
-inline constexpr const char* SVFootHillSessionCtrl_getPersistentKey =
+// dlsym is exact: count S8_ segments against `nm -D libandroidappmusic.so`.
+// In Itanium mangling, the first std::string arg is spelled out fully (the
+// `RKNSt6__ndk112basic_string...` chunk) and creates a substitution slot. Each
+// subsequent std::string arg is then `S8_`. So:
+//     N string args == 1 explicit `RKNSt...` + (N-1) `S8_`.
+//
+// 8 string params (= seven `S8_`). Used by zhaarey/agent-arm64.js on builds
+// where Apple split adam_id into a separate prefetch slot (adam_id duplicated).
+inline constexpr const char* SVFootHillSessionCtrl_getPersistentKey_8str =
+    "_ZN21SVFootHillSessionCtrl16getPersistentKeyERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEES8_S8_S8_S8_S8_S8_S8_";
+
+// 7 string params (= six `S8_`). What `nm -D` shows on both arm64-v8a and
+// x86_64 splits of Apple Music 3.6.0-beta-1109. No prefetch slot — one
+// adam_id, six other strings (uri, key format, key format version, server
+// uri, protocol type, fps cert).
+inline constexpr const char* SVFootHillSessionCtrl_getPersistentKey_7str =
     "_ZN21SVFootHillSessionCtrl16getPersistentKeyERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEES8_S8_S8_S8_S8_S8_";
+
+// Legacy alias points at the variant that actually exports on the pinned
+// APK (3.6.0-beta-1109): the 7-string / six-`S8_` symbol. Kept so unqualified
+// references to mangled::SVFootHillSessionCtrl_getPersistentKey resolve to
+// the working symbol; loader.cpp tries _8str first, then _7str regardless.
+inline constexpr const char* SVFootHillSessionCtrl_getPersistentKey =
+    SVFootHillSessionCtrl_getPersistentKey_7str;
 
 inline constexpr const char* SVFootHillSessionCtrl_decryptContext =
     "_ZN21SVFootHillSessionCtrl14decryptContextERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEERKN11SVDecryptor15SVDecryptorTypeERKb";

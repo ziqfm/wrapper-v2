@@ -5,8 +5,10 @@
 #include <cstring>
 #include <utility>
 
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include "apple/aarch64_sret_thunks.hpp"
 #include "apple/loader.hpp"
 #include "apple/runtime.hpp"
 #include "apple/tokens.hpp"
@@ -18,6 +20,19 @@ namespace {
 void unlink_quiet(const char* path) {
     if (path == nullptr || *path == '\0') return;
     (void)::unlink(path);
+}
+
+// Apple writes mpl_db/kvs.sqlitedb the first time AuthenticateFlow succeeds.
+// Without that file, RequestContext::storeFrontIdentifier on arm64 dereferences
+// uninitialized internal state at offset 0x10 and SIGSEGVs (x86_64 returns an
+// empty string instead). Gate the cached-session probe on this file so a cold
+// `./data` mount does not crash the daemon at startup.
+bool warm_session_present(const std::string& base_dir) {
+    if (base_dir.empty()) return false;
+    const std::string kvs = base_dir + "/mpl_db/kvs.sqlitedb";
+    struct stat st{};
+    if (::stat(kvs.c_str(), &st) != 0) return false;
+    return S_ISREG(st.st_mode) && st.st_size > 0;
 }
 
 }  // namespace
@@ -103,7 +118,26 @@ bool Account::submit_2fa(std::string code) {
 }
 
 bool Account::try_restore_cached_session(const Loader& loader, const Runtime& runtime) {
+    std::fprintf(stderr, "auth: entered\n"); std::fflush(stderr);
     if (!loader.ok() || !runtime.initialized()) {
+        std::fprintf(stderr, "auth: early exit\n"); std::fflush(stderr);
+        return false;
+    }
+    std::fprintf(stderr, "auth: checks ok\n"); std::fflush(stderr);
+
+    std::fprintf(stderr, "auth: calling base_dir ...\n"); std::fflush(stderr);
+    std::string bd = runtime.base_dir();
+    std::fprintf(stderr, "auth: base_dir='%s' len=%zu\n", bd.c_str(), bd.size());
+    std::fflush(stderr);
+
+    std::fprintf(stderr, "auth: calling warm_session_present ...\n"); std::fflush(stderr);
+    bool warm = warm_session_present(bd);
+    std::fprintf(stderr, "auth: warm=%d\n", warm ? 1 : 0); std::fflush(stderr);
+    if (!warm) {
+        std::fprintf(stderr,
+                     "auth: no warm Apple session at %s/mpl_db/kvs.sqlitedb; "
+                     "skipping cached-session restore\n",
+                     bd.c_str());
         return false;
     }
 
@@ -301,7 +335,8 @@ void Account::worker_main() {
     }
 
     abi::shared_ptr flow;
-    s.make_shared_AuthenticateFlow(&flow, &req_ctx);
+    aarch64_sret::make_shared_authenticate_flow(&flow, &req_ctx,
+                                                s.make_shared_AuthenticateFlow);
     if (flow.obj == nullptr) {
         finish_failed("make_shared<AuthenticateFlow> returned null", -3);
         return;
