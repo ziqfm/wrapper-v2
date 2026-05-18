@@ -12,9 +12,10 @@ decryption, and gives downstream tooling (e.g. [`gamdl`](https://github.com/glom
 a uniform interface that does not depend on platform or language.
 
 The daemon ships _no_ Apple code. At build time, libraries are extracted from
-a pinned Apple Music for Android APK split (3.6.0-beta, build 1109) whose
-SHA-256 digests are committed in `LIBS_VERSION.json`. Without a matching APK
-the build fails loudly.
+an Apple Music for Android **3.6.0-beta (1109)** arch split (`.apk` or `.apkm`
+bundle) and each `.so` is checked against SHA-256 pins in `LIBS_VERSION.json`.
+The bundle/APK file itself is not hashed; a wrong split still fails when the
+library digests do not match.
 
 ## HTTP API
 
@@ -83,7 +84,7 @@ Optional `WRAPPER_APPLE_ID` only sets the `apple_id` label in `/me` after restor
 ├── CMakeLists.txt            top-level build (host launcher + NDK sub-build)
 ├── Dockerfile                multi-stage build
 ├── compose.yaml              docker compose entrypoint
-├── LIBS_VERSION.json         pinned APK + per-.so SHA-256 digests
+├── LIBS_VERSION.json         per-.so SHA-256 digests (+ optional apkm pin for fetch-apk)
 ├── src/
 │   ├── daemon/               C++ daemon (cross-compiled with the NDK)
 │   │   ├── CMakeLists.txt
@@ -102,8 +103,8 @@ Optional `WRAPPER_APPLE_ID` only sets the `apple_id` label in `/me` after restor
 │       ├── bin/              <- main, linker64 (staged)
 │       └── lib64/            <- Apple's .so + Android system .so (staged)
 ├── tools/
-│   ├── fetch-apk.sh          download an APK / .apkm, verify SHA-256
-│   ├── extract-libs.sh       extract .so files from APK, verify SHA-256
+│   ├── fetch-apk.sh          download a .apkm, verify bundle SHA-256 (optional)
+│   ├── extract-libs.sh       extract .so from .apkm or arch split .apk; verify each lib
 │   └── stage-system.sh       copy committed Android binaries into rootfs/
 └── vendor/
     └── android-system/       linker64 + bionic + AOSP libs, SHA-pinned
@@ -136,8 +137,10 @@ APK_URL=https://your-mirror.example/apple-music-3.6.0-beta-1109.apkm \
     tools/fetch-apk.sh --expect apkm
 
 # 2. Extract Apple libs. Default --out is rootfs/system/lib64.
-#    The .apkm must match LIBS_VERSION.json; each .so matches .libs.<arch>.
+#    Pass a .apkm bundle or an arch split .apk; each .so must match .libs.<arch>.
 tools/extract-libs.sh --bundle .tmp/bundle.apkm --arch x86_64
+# Or, if you already have the split APK:
+# tools/extract-libs.sh --bundle path/to/split_config.x86_64.apk --arch x86_64
 
 # 3. Stage the committed Android system binaries (linker64 + bionic + AOSP)
 #    into rootfs/, verifying their SHA-256 against LIBS_VERSION.json.
@@ -164,7 +167,7 @@ on machines that already have something on `:80`.
 
 ### arm64-v8a image (Apple Silicon / AArch64 Linux)
 
-Use the same `.apkm`, but extract and stage **arm64-v8a**, then build a **linux/arm64**
+Use the same `.apkm` (or an **arm64-v8a** split `.apk`), extract and stage **arm64-v8a**, then build a **linux/arm64**
 image so `wrapper`, the NDK daemon, and the staged `linker64` / `.so` set share the
 same ABI.
 
