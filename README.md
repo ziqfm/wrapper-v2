@@ -1,7 +1,7 @@
 # wrapper-v2
 
 A clean rewrite of the Apple Music FairPlay decryption wrapper. Currently in
-**Phase 1.3** — same as 1.1, plus **`GET /playback`** (Phase 1.2) and **`POST /decrypt`**.
+**Phase 1.3** — same as 1.1, plus **`GET /playback`** (Phase 1.2) and **`POST /decrypt/sample`**.
 **Phase 3** is done for **`arm64-v8a`** images (NDK cross-build + multi-arch Docker;
 see **Building** → arm64-v8a).
 
@@ -25,13 +25,15 @@ the build fails loudly.
 | 1.0   | Apple lib runtime init, dlopen loader, vendored AOSP closure                                              | **Done** |
 | 1.1   | `POST /login`, `POST /login/2fa`, token harvest, `/me`, startup session restore (warm `WRAPPER_BASE_DIR`) | **Done** |
 | 1.2   | `GET /playback` (full MZ playback dispatch as native JSON)                                                | **Done** |
-| 1.3   | `POST /decrypt` (FairPlay FPS sample decrypt, JSON base64 batch)                                          | **Done** |
+| 1.3   | `POST /decrypt/sample` (FairPlay FPS sample decrypt, binary batch)                                        | **Done** |
 | 2     | Rate limit, dedupe, request queue                                                                         | Pending  |
 | 3     | arm64-v8a build, multi-arch Docker                                                                        | **Done** |
 
 ## HTTP API
 
-All endpoints accept and return `application/json`.
+Most endpoints accept and return `application/json`. `POST /decrypt/sample`
+uses `application/octet-stream` for successful request and response bodies;
+errors still return JSON.
 
 | Method   | Path         | Description                                                                                                                                                                                                                                                                                                                                                                        |
 | -------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -40,8 +42,43 @@ All endpoints accept and return `application/json`.
 | `POST`   | `/login`     | Body: `{"username": "...", "password": "..."}` or `{"apple_id": "...", "password": "..."}` (synonyms). Drives Apple's `AuthenticateFlow`. Returns `200` + token snapshot, `202` if **2FA** is required (then `POST /login/2fa`), or `401` on failure.                                                                                                                              |
 | `POST`   | `/login/2fa` | Body: `{"code": "123456"}`. Continues a login waiting for HSA2.                                                                                                                                                                                                                                                                                                                    |
 | `GET`    | `/playback`  | Query string `?adam_id=<numeric store id>`. Returns `200` with a JSON object `{"songList":[...]}` containing the **whole MZ playback dispatch** Apple's `subDownload` URL bag returns (every flavor, key URI, asset URL, metadata field). CFData fields are base64; CFDate fields are ISO 8601. Needs an **authenticated** session; otherwise `401` / `503`. Apple errors → `502`. |
-| `POST`   | `/decrypt`   | Body: `{"adam_id":"<store adam id>","uri":"<skd://...>","samples":["<base64>",...]}` or a single `"sample":"..."`. Returns `200` `{"samples":["<base64 plaintext>",...]}`. Needs **authenticated** session and `playback_ready`; otherwise `401` / `503`. Apple errors → `502`.                                                                                                    |
+| `POST`   | `/decrypt/sample` | Binary FairPlay sample decrypt batch. Request frame contains `adam_id`, SKD `uri`, and one or more encrypted samples. Response frame contains plaintext samples. Needs **authenticated** session and `playback_ready`; otherwise `401` / `503`. Apple errors → `502`.                                                                                                   |
 | `DELETE` | `/login`     | Aborts an in-flight login or clears cached tokens from memory. Apple's on-disk `mpl_db` cache is unchanged.                                                                                                                                                                                                                                                                        |
+
+### `POST /decrypt/sample` Binary Format
+
+All integer fields are unsigned 32-bit big-endian.
+
+Request body:
+
+```text
+adam_id_len
+uri_len
+sample_count
+sample_len[0]
+...
+sample_len[sample_count - 1]
+adam_id bytes
+uri bytes
+sample[0] bytes
+...
+sample[sample_count - 1] bytes
+```
+
+Response body:
+
+```text
+sample_count
+sample_len[0]
+...
+sample_len[sample_count - 1]
+sample[0] bytes
+...
+sample[sample_count - 1] bytes
+```
+
+The endpoint accepts and returns `application/octet-stream` on success.
+Validation and Apple/native errors use the normal JSON error envelope.
 
 Sign-in matches the legacy wrapper model: you send **email (Apple ID) and password**
 to the daemon; it fills credentials through the native presentation interface.

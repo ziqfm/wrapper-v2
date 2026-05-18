@@ -1,12 +1,10 @@
 #include "server.hpp"
 
 #include <chrono>
-#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -41,57 +39,6 @@ void access_log(const char* method, const httplib::Request& req) {
     const std::string& peer = req.remote_addr;
     const char* p = peer.empty() ? "-" : peer.c_str();
     std::fprintf(stderr, "http: %s %s client=%s\n", method, req.path.c_str(), p);
-}
-
-int base64_dec_digit(unsigned char c) {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
-    return -1;
-}
-
-bool base64_decode(std::string_view in, std::vector<std::uint8_t>* out) {
-    out->clear();
-    int val = 0, valb = -8;
-    for (unsigned char c : in) {
-        if (std::isspace(static_cast<unsigned char>(c)) != 0) continue;
-        if (c == '=') break;
-        int d = base64_dec_digit(c);
-        if (d < 0) return false;
-        val = (val << 6) + d;
-        valb += 6;
-        if (valb >= 0) {
-            out->push_back(static_cast<std::uint8_t>((val >> valb) & 0xFF));
-            valb -= 8;
-        }
-    }
-    return true;
-}
-
-std::string base64_encode(const std::vector<std::uint8_t>& data) {
-    static const char tbl[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string ret;
-    ret.reserve(((data.size() + 2) / 3) * 4);
-    unsigned int val = 0;
-    int          valb = -6;
-    for (std::uint8_t c : data) {
-        val = (val << 8) + c;
-        valb += 8;
-        while (valb >= 0) {
-            ret.push_back(tbl[(val >> valb) & 0x3F]);
-            valb -= 6;
-        }
-    }
-    if (valb > -6) {
-        ret.push_back(tbl[((val << 8) >> (valb + 8)) & 0x3F]);
-    }
-    while (ret.size() % 4 != 0) {
-        ret.push_back('=');
-    }
-    return ret;
 }
 
 std::string iso8601_utc(std::chrono::system_clock::time_point tp) {
@@ -159,6 +106,127 @@ int http_status_for(apple::LoginState s) {
     return 500;
 }
 
+std::uint32_t read_u32_be(const std::uint8_t* p) {
+    return (static_cast<std::uint32_t>(p[0]) << 24)
+         | (static_cast<std::uint32_t>(p[1]) << 16)
+         | (static_cast<std::uint32_t>(p[2]) << 8)
+         |  static_cast<std::uint32_t>(p[3]);
+}
+
+void append_u32_be(std::string* out, std::uint32_t v) {
+    out->push_back(static_cast<char>((v >> 24) & 0xff));
+    out->push_back(static_cast<char>((v >> 16) & 0xff));
+    out->push_back(static_cast<char>((v >> 8) & 0xff));
+    out->push_back(static_cast<char>(v & 0xff));
+}
+
+struct SampleDecryptFrame {
+    std::string adam_id;
+    std::string uri;
+    std::vector<std::vector<std::uint8_t>> samples;
+};
+
+bool parse_sample_decrypt_frame(const std::string& body,
+                                SampleDecryptFrame* out,
+                                std::string* error) {
+    constexpr std::uint32_t kMaxSamples = 100000;
+    constexpr std::uint32_t kMaxFieldLen = 1024 * 1024;
+    constexpr std::uint64_t kMaxBodyLen = 256ull * 1024ull * 1024ull;
+
+    const auto* data = reinterpret_cast<const std::uint8_t*>(body.data());
+    const std::size_t size = body.size();
+    if (size > kMaxBodyLen) {
+        *error = "request body too large";
+        return false;
+    }
+    if (size < 12) {
+        *error = "frame too short";
+        return false;
+    }
+
+    const std::uint32_t adam_len = read_u32_be(data);
+    const std::uint32_t uri_len = read_u32_be(data + 4);
+    const std::uint32_t sample_count = read_u32_be(data + 8);
+    if (adam_len == 0 || uri_len == 0) {
+        *error = "adam_id and uri must be non-empty";
+        return false;
+    }
+    if (adam_len > kMaxFieldLen || uri_len > kMaxFieldLen) {
+        *error = "adam_id or uri is too large";
+        return false;
+    }
+    if (sample_count == 0 || sample_count > kMaxSamples) {
+        *error = "sample_count must be between 1 and 100000";
+        return false;
+    }
+
+    const std::uint64_t table_bytes = static_cast<std::uint64_t>(sample_count) * 4u;
+    const std::uint64_t fixed = 12ull + table_bytes + adam_len + uri_len;
+    if (fixed > size) {
+        *error = "frame length table exceeds request body";
+        return false;
+    }
+
+    std::vector<std::uint32_t> lengths;
+    lengths.reserve(sample_count);
+    std::uint64_t sample_bytes = 0;
+    const std::uint8_t* lenp = data + 12;
+    for (std::uint32_t i = 0; i < sample_count; ++i) {
+        const std::uint32_t n = read_u32_be(lenp + (static_cast<std::size_t>(i) * 4u));
+        if (n == 0) {
+            *error = "sample length must be non-zero";
+            return false;
+        }
+        sample_bytes += n;
+        if (sample_bytes > kMaxBodyLen) {
+            *error = "sample payload too large";
+            return false;
+        }
+        lengths.push_back(n);
+    }
+    if (fixed + sample_bytes != size) {
+        *error = "frame size does not match declared lengths";
+        return false;
+    }
+
+    const char* p = body.data() + 12 + static_cast<std::size_t>(table_bytes);
+    out->adam_id.assign(p, adam_len);
+    p += adam_len;
+    out->uri.assign(p, uri_len);
+    p += uri_len;
+
+    out->samples.clear();
+    out->samples.reserve(sample_count);
+    for (std::uint32_t n : lengths) {
+        const auto* b = reinterpret_cast<const std::uint8_t*>(p);
+        out->samples.emplace_back(b, b + n);
+        p += n;
+    }
+    return true;
+}
+
+bool build_sample_decrypt_frame(const std::vector<std::vector<std::uint8_t>>& samples,
+                                std::string* out) {
+    if (samples.size() > 0xffffffffu) return false;
+    std::uint64_t size = 4ull + (static_cast<std::uint64_t>(samples.size()) * 4ull);
+    for (const auto& sample : samples) {
+        if (sample.size() > 0xffffffffu) return false;
+        size += sample.size();
+    }
+    if (size > static_cast<std::uint64_t>(out->max_size())) return false;
+
+    out->clear();
+    out->reserve(static_cast<std::size_t>(size));
+    append_u32_be(out, static_cast<std::uint32_t>(samples.size()));
+    for (const auto& sample : samples) {
+        append_u32_be(out, static_cast<std::uint32_t>(sample.size()));
+    }
+    for (const auto& sample : samples) {
+        out->append(reinterpret_cast<const char*>(sample.data()), sample.size());
+    }
+    return true;
+}
+
 }  // namespace
 
 Server::Server(httplib::Server& svr,
@@ -172,7 +240,7 @@ void Server::mount() {
     // ---- GET /health ----
     // Liveness + runtime debug info. Always returns 200 if the
     // process is up; consumers should treat runtime.initialized==false
-    // as a soft failure (auth/decrypt won't work) rather than a hard one.
+    // as a soft failure (auth/decrypt endpoints won't work) rather than a hard one.
     svr_.Get("/health", [this](const httplib::Request& req, httplib::Response& res) {
         access_log("GET", req);
         json runtime = {
@@ -393,7 +461,7 @@ void Server::mount() {
         apple::PlaybackResult pr;
         {
             // PurchaseRequest drives Apple's URLBag dispatcher; same global
-            // state /decrypt touches, so share the playback mutex to avoid
+            // state /decrypt/sample touches, so share the playback mutex to avoid
             // overlap with a concurrent decrypt request.
             std::lock_guard<std::mutex> lock(rt_.playback_mutex());
             pr = apple::fetch_playback_json(loader_, rt_, std::move(adam_id));
@@ -410,10 +478,16 @@ void Server::mount() {
         respond_json(res, 200, std::move(pr.body));
     });
 
-    // ---- POST /decrypt ----
-    // FairPlay sample decrypt. Body: adam_id, uri, samples: [base64, ...]
-    // or a single "sample": base64. Requires authenticated + playback_ready.
-    svr_.Post("/decrypt", [this](const httplib::Request& req, httplib::Response& res) {
+    // ---- POST /decrypt/sample ----
+    // FairPlay sample decrypt. Binary request:
+    //   u32be adam_id_len, u32be uri_len, u32be sample_count,
+    //   u32be sample_len[sample_count], adam_id bytes, uri bytes,
+    //   concatenated ciphertext samples.
+    // Binary response:
+    //   u32be sample_count, u32be sample_len[sample_count],
+    //   concatenated plaintext samples.
+    // Requires authenticated + playback_ready.
+    svr_.Post("/decrypt/sample", [this](const httplib::Request& req, httplib::Response& res) {
         access_log("POST", req);
         if (!rt_.initialized()) {
             respond_json(res, 503, json{
@@ -437,83 +511,18 @@ void Server::mount() {
             return;
         }
 
-        json body;
-        try {
-            body = json::parse(req.body);
-        } catch (const std::exception& e) {
-            respond_json(res, 400, json{{"error", "invalid_json"}, {"detail", e.what()}});
-            return;
-        }
-        if (!body.is_object()) {
-            respond_json(res, 400, json{{"error", "invalid_body"}, {"detail", "expected object"}});
-            return;
-        }
-
-        std::string adam_id;
-        if (body.contains("adam_id") && body["adam_id"].is_string()) {
-            adam_id = body["adam_id"].get<std::string>();
-        } else if (body.contains("adamId") && body["adamId"].is_string()) {
-            adam_id = body["adamId"].get<std::string>();
-        } else {
-            respond_json(res, 400, json{
-                {"error", "missing_field"},
-                {"detail", "expected string 'adam_id' (or 'adamId')"},
-            });
-            return;
-        }
-
-        if (!body.contains("uri") || !body["uri"].is_string()) {
-            respond_json(res, 400, json{
-                {"error", "missing_field"},
-                {"detail", "expected string 'uri' (SKD URI)"},
-            });
-            return;
-        }
-        std::string uri = body["uri"].get<std::string>();
-
-        std::vector<std::vector<std::uint8_t>> ciphertexts;
-        if (body.contains("samples")) {
-            if (!body["samples"].is_array()) {
-                respond_json(res, 400, json{{"error", "invalid_field"}, {"detail", "'samples' must be array"}});
-                return;
-            }
-            for (const auto& el : body["samples"]) {
-                if (!el.is_string()) {
-                    respond_json(res, 400, json{{"error", "invalid_field"}, {"detail", "each sample must be base64 string"}});
-                    return;
-                }
-                std::vector<std::uint8_t> chunk;
-                if (!base64_decode(el.get<std::string>(), &chunk)) {
-                    respond_json(res, 400, json{{"error", "invalid_base64"}, {"detail", "samples must be standard base64"}});
-                    return;
-                }
-                ciphertexts.push_back(std::move(chunk));
-            }
-        } else if (body.contains("sample") && body["sample"].is_string()) {
-            std::vector<std::uint8_t> chunk;
-            if (!base64_decode(body["sample"].get<std::string>(), &chunk)) {
-                respond_json(res, 400, json{{"error", "invalid_base64"}, {"detail", "sample must be standard base64"}});
-                return;
-            }
-            ciphertexts.push_back(std::move(chunk));
-        } else {
-            respond_json(res, 400, json{
-                {"error", "missing_field"},
-                {"detail", "expected 'samples' array or string 'sample' (base64)"},
-            });
-            return;
-        }
-
-        if (adam_id.empty() || uri.empty()) {
-            respond_json(res, 400, json{{"error", "empty_field"}, {"detail", "adam_id and uri must be non-empty"}});
+        SampleDecryptFrame frame;
+        std::string parse_error;
+        if (!parse_sample_decrypt_frame(req.body, &frame, &parse_error)) {
+            respond_json(res, 400, json{{"error", "invalid_frame"}, {"detail", parse_error}});
             return;
         }
 
         apple::DecryptResult dr;
         {
             std::lock_guard<std::mutex> lock(rt_.playback_mutex());
-            dr = apple::decrypt_samples(loader_, rt_, std::move(adam_id), std::move(uri),
-                                        std::move(ciphertexts));
+            dr = apple::decrypt_samples(loader_, rt_, std::move(frame.adam_id), std::move(frame.uri),
+                                        std::move(frame.samples));
         }
 
         if (!dr.ok) {
@@ -524,11 +533,16 @@ void Server::mount() {
             return;
         }
 
-        json samples = json::array();
-        for (const auto& p : dr.plaintexts) {
-            samples.push_back(base64_encode(p));
+        std::string response_body;
+        if (!build_sample_decrypt_frame(dr.plaintexts, &response_body)) {
+            respond_json(res, 500, json{
+                {"error", "response_too_large"},
+                {"detail", "decrypted sample frame is too large"},
+            });
+            return;
         }
-        respond_json(res, 200, json{{"samples", std::move(samples)}});
+        res.status = 200;
+        res.set_content(response_body, "application/octet-stream");
     });
 
     // ---- DELETE /login ----
