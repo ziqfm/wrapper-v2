@@ -69,19 +69,11 @@ bool Account::start_login(const Loader& loader,
         return false;
     }
 
-    if (s == LoginState::Authenticated) {
-        // Previous worker has exited; join so std::thread does not stay
-        // joinable forever (e.g. client only POSTs /login again).
-        if (worker_.joinable()) {
-            worker_.join();
-        }
-        return false;
-    }
-
     // Drain a previous worker thread, if any. join() outside the lock
     // would risk re-entering Account from the worker; we take the
     // hit of joining under the lock since the worker has already
-    // transitioned out of the busy states.
+    // transitioned out of the busy states. This also allows POST /login
+    // to refresh an existing Authenticated snapshot after a stale restore.
     if (worker_.joinable()) {
         worker_.join();
     }
@@ -118,6 +110,8 @@ bool Account::submit_2fa(std::string code) {
 }
 
 bool Account::try_restore_cached_session(const Loader& loader, const Runtime& runtime) {
+    std::lock_guard<std::mutex> restore_guard(restore_mu_);
+
     if (!loader.ok() || !runtime.initialized()) {
         return false;
     }
@@ -149,6 +143,8 @@ bool Account::try_restore_cached_session(const Loader& loader, const Runtime& ru
         tokens_          = Tokens{};
         last_error_.clear();
         last_error_code_ = 0;
+        state_.store(LoginState::InProgress, std::memory_order_release);
+        cv_state_.notify_all();
     }
 
     const Symbols& s         = loader.sym();
@@ -157,14 +153,21 @@ bool Account::try_restore_cached_session(const Loader& loader, const Runtime& ru
         std::lock_guard<std::mutex> g(mu_);
         loader_  = nullptr;
         runtime_ = nullptr;
+        state_.store(LoginState::LoggedOut, std::memory_order_release);
+        cv_state_.notify_all();
         return false;
     }
     auto device_guid = runtime.device_guid_copy();
     Tokens t;
     if (!tokens::harvest_all(s, req_ctx, device_guid, &t)) {
+        std::fprintf(stderr,
+                     "auth: cached-session restore found Apple session files "
+                     "but token harvest failed\n");
         std::lock_guard<std::mutex> g(mu_);
         loader_  = nullptr;
         runtime_ = nullptr;
+        state_.store(LoginState::LoggedOut, std::memory_order_release);
+        cv_state_.notify_all();
         return false;
     }
 

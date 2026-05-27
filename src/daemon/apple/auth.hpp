@@ -91,8 +91,10 @@ public:
     ~Account();
 
     // Returns false if a login is already in progress (InProgress or
-    // Awaiting2FA), or already authenticated (call logout / DELETE /login
-    // before signing in again). On true, the worker thread has been started.
+    // Awaiting2FA). A fresh login request is allowed to replace an existing
+    // authenticated snapshot, which lets clients recover from stale restored
+    // Apple sessions without a separate DELETE /login. On true, the worker
+    // thread has been started.
     bool start_login(const Loader& loader,
                      const Runtime& runtime,
                      std::string apple_id,
@@ -143,6 +145,7 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_state_;       // notified on any state change
     std::condition_variable cv_2fa_;         // notified when 2FA code arrives or logout
+    std::mutex restore_mu_;                  // serializes cached-session harvests
     std::atomic<LoginState> state_{LoginState::LoggedOut};
 
     // Inputs for the active login attempt.

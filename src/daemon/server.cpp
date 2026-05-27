@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <string>
@@ -120,6 +121,27 @@ json runtime_to_json(const apple::Loader& loader,
         runtime["device_info"] = rt.device_info();
     }
     return runtime;
+}
+
+bool restore_session_enabled() {
+    const char* v = std::getenv("WRAPPER_RESTORE_SESSION");
+    if (v == nullptr || *v == '\0') return true;
+    return std::strcmp(v, "0") != 0
+        && std::strcmp(v, "false") != 0
+        && std::strcmp(v, "no") != 0;
+}
+
+bool authenticated_or_restored(apple::Account& account,
+                               const apple::Loader& loader,
+                               const apple::Runtime& rt) {
+    if (account.state() == apple::LoginState::Authenticated) {
+        return true;
+    }
+    if (!restore_session_enabled()) {
+        return false;
+    }
+    return account.try_restore_cached_session(loader, rt)
+        || account.state() == apple::LoginState::Authenticated;
 }
 
 int http_status_for(apple::LoginState s) {
@@ -297,6 +319,9 @@ void Server::mount() {
     // exposed — only dev_token, music_user_token, storefront, dsid.
     svr_.Get("/me", [this](const httplib::Request& req, httplib::Response& res) {
         access_log("GET", req);
+        if (rt_.initialized() && restore_session_enabled()) {
+            (void)authenticated_or_restored(account_, loader_, rt_);
+        }
         json body = {
             {"version", info_.version},
             {"runtime", runtime_to_json(loader_, rt_, info_)},
@@ -379,13 +404,6 @@ void Server::mount() {
         }
 
         if (!account_.start_login(loader_, rt_, std::move(login_name), std::move(password))) {
-            if (account_.state() == apple::LoginState::Authenticated) {
-                respond_json(res, 409, json{
-                    {"error", "already_authenticated"},
-                    {"detail", "call DELETE /login before signing in again"},
-                });
-                return;
-            }
             respond_json(res, 409, json{
                 {"error", "already_in_progress"},
                 {"detail", "a login flow is already running; DELETE /login to abort"},
@@ -456,7 +474,7 @@ void Server::mount() {
             });
             return;
         }
-        if (account_.state() != apple::LoginState::Authenticated) {
+        if (!authenticated_or_restored(account_, loader_, rt_)) {
             respond_json(res, 401, json{
                 {"error", "not_authenticated"},
                 {"detail", "POST /login or restore a session first"},
@@ -529,7 +547,7 @@ void Server::mount() {
             });
             return;
         }
-        if (account_.state() != apple::LoginState::Authenticated) {
+        if (!authenticated_or_restored(account_, loader_, rt_)) {
             respond_json(res, 401, json{
                 {"error", "not_authenticated"},
                 {"detail", "POST /login or restore a session first"},
