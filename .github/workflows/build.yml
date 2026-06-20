@@ -121,3 +121,15 @@ jobs:
           fi
           curl -sf http://127.0.0.1:8080/health | jq .
           docker rm -f wrapper-smoke
+
+      - name: Save Docker Image to Tarball
+        run: |
+          mkdir -p .tmp
+          docker save wrapper-v2:${{ github.sha }} | gzip > .tmp/wrapper-image-${{ matrix.arch }}.tar.gz
+
+      - name: Upload Finished Image File
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-image-${{ matrix.arch }}
+          path: .tmp/wrapper-image-${{ matrix.arch }}.tar.gz
+          retention-days: 1
